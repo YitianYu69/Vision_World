@@ -17,6 +17,7 @@ class Trainer():
     def __init__(self, 
                  *,
                  model: nn.Module,
+                 compile_type: str = None,
                  DS_config: Dict = None,
                  DDP_config: Dict = None,
                  criterion: Union[nn.Module, Callable] = None,
@@ -41,18 +42,35 @@ class Trainer():
         self.grad_acc_step = grad_acc_step
         self.amp_enable = amp_enable
         self.device = device
+        
+        # Avoid multiple dist function call
+        rank0 = dist.get_rank() == 0
 
-        if self.DS_config is not None:
+        # If using CUDA, move model to device first!
+        if self.device != 'cpu':
             model.to(device)
+        
+        # Check for compile
+        if compile_type is not None:
+            fullgraph = False if DS_config is not None else True
+            model.compile(fullgraph=fullgraph, mode=compile_type)
+            if (DS_config is not None or DDP_config is not None) and compile_type != 'reduce-overhead' and rank0:
+                logger.info("""For the max speed optimization, recommand to enable reduce-overhead compile mode
+                            to avoid rebuild autograd graph!""")
+
+        # ---------------------------------------------
+        # Warp model to enable different optimization
+        # ---------------------------------------------
+        if self.DS_config is not None:
             self.engine, _ = deepspeed.initialize(
                 model=model,
                 model_parameters=model.parameters(),
                 config=DS_config
             )
         elif self.DDP_config is not None:
-            if dist.is_available() and dist.is_initialized() and dist.get_rank() == 0 and self.DDP_config['broadcast_buffers']:
+            if dist.is_available() and dist.is_initialized() and rank0 and self.DDP_config['broadcast_buffers']:
                 logger.info(f'Please turn off the broadcast_buffers, if you used the torch.nn.SyncBatchNorm.convert_sycn_batchnorm()')
-            if dist.is_available() and dist.is_initialized() and dist.get_rank() == 0 and self.DDP_config['gradient_as_bucket_view']:
+            if dist.is_available() and dist.is_initialized() and rank0 and self.DDP_config['gradient_as_bucket_view']:
                 logger.info(f'Please turn on the set_to_none for your optimizaer.zer_grad()! If you do not, then your DDP grad bucket will be zeroed out!')
 
             model.to(device)
@@ -70,8 +88,11 @@ class Trainer():
                 device_ids=self.DDP_config.get('device_ids'),
                 **ddp_kwargs)
         else:
-            self.engine = model.to(device)
-        
+            self.engine = model
+
+        # ---------------------------------------------------
+        # If TP2 AMP enabled, auto check the best cast dtype
+        # ---------------------------------------------------
         if not self._is_deepspeed() and amp_enable:
             major, _ = torch.cuda.get_device_capability(torch.device(device))
             self.cast_dtype = torch.bfloat16 if major >= 8 and torch.cuda.is_available() else torch.float16
