@@ -1,10 +1,6 @@
 import torch
-import torch.distributed as dist
+from torchmetrics import Metric, Accuracy, Recall, Precision, F1Score, AUROC
 
-import torchmetrics
-from torchmetrics import Metric
-
-import os
 from typing import List, Union
 
 def build_metrics(*, metric_lists: List[str],
@@ -30,21 +26,3 @@ def build_metrics(*, metric_lists: List[str],
         else:
             new_metrics[m] = metrics[m]
     return new_metrics
-        
-
-def setup_ddp():
-    dist.init_process_group(
-        backend='nccl',
-        init_method='env://'
-    )
-
-    local_rank = int(os.environ['LOCAL_RANK'])
-    global_rank = dist.get_rank()
-    world_size = dist.get_world_size()
-    device = f'cuda:{local_rank}'
-
-    torch.cuda.set_device(device)
-    return local_rank, global_rank, world_size, device
-
-def clean():
-    dist.destory_process_group()
