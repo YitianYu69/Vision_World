@@ -3,6 +3,11 @@ from torch import nn
 
 import math
 
+# --------------------------------------------------------------------------------------------
+# This EfficientNetV1 model implemented according to the Paper:
+# arXiv:1905.11946 - EfficientNet: Rethinking Model Scaling for Convolutional Neural Networks
+# --------------------------------------------------------------------------------------------
+
 
 params = {
     "efficientnet_b0": (1.0, 1.0, 224, 0.2),
@@ -121,7 +126,7 @@ def _round_repeats(repeats, depth_mult):
         return int(math.ceil(repeats * depth_mult))
         
         
-class EfficientNetV1(nn.Module):
+class _EfficientNetV1(nn.Module):
     def __init__(self, width_mult=1.0, depth_mult=1.0, dropout_p=0.2, num_classes=1000):
         super().__init__()
 
@@ -181,7 +186,7 @@ class EfficientNetV1(nn.Module):
         return self.classifier(x)
 
 
-def _efficientnet(arch, **kwargs):
+def EfficientNetV1(arch, **kwargs):
     width_mult, depth_mult, _, dropout_p = params[arch]
     model = EfficientNetV1(width_mult, depth_mult, dropout_p, **kwargs)
     return model

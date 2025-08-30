@@ -2,7 +2,14 @@ import torch
 from torch import nn
 
 
-class ResBlock(nn.Module):
+# -----------------------------------------------------------------
+# This ResNetV1 model implemented according to the Paper:
+# arXiv:1512.03385 - Deep Residual Learning for Image Recognition
+# -----------------------------------------------------------------
+
+
+
+class ResV1Block(nn.Module):
     def __init__(self, in_planes, planes, mid_conv_stride=1, downsample=None, residual=True):
         super().__init__()
 
@@ -74,14 +81,14 @@ class ResNetV1(nn.Module):
             )
 
         layers.append(
-            ResBlock(self.in_planes,
+            ResV1Block(self.in_planes,
                     planes,
                     mid_conv_stride=stride,
                     downsample=downsample)
         )
         self.in_planes = planes * 4
         for _ in range(num_blocks - 1):
-            layers.append(ResBlock(self.in_planes, plane))
+            layers.append(ResV1Block(self.in_planes, plane))
 
         return layers
 
