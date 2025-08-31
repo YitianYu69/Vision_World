@@ -1,6 +1,12 @@
 import torch
 from torch import nn
 
+
+# -----------------------------------------------------------------
+# This ResNetV1 model implemented according to the Paper:
+# arXiv:1603.05027 - Identity Mappings in Deep Residual Networks
+# -----------------------------------------------------------------
+
 class ResNetV2Block(nn.Module):
     def __init__(self, in_planes, planes, mid_conv_stride=1, downsample=None, residual=True):
         super().__init__()
