@@ -59,7 +59,7 @@ class Trainer():
                             to avoid rebuild autograd graph!""")
 
         # ---------------------------------------------
-        # Warp model to enable different optimization
+        # Wrap model to enable different optimization
         # ---------------------------------------------
         if self.DS_config is not None:
             self.engine, _ = deepspeed.initialize(
