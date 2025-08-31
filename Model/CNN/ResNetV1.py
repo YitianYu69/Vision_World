@@ -62,7 +62,7 @@ class ResNetV1(nn.Module):
         self.relu1 = nn.ReLU()
         self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
 
-        self.layer1 = self._make_layer(layer_counys[0], planes=64, stride=1)
+        self.layer1 = self._make_layer(layer_counts[0], planes=64, stride=1)
         self.layer2 = self._make_layer(layer_counts[1], planes=128, stride=2)
         self.layer3 = self._make_layer(layer_counts[2], planes=256, stride=2)
         self.layer4 = self._make_layer(layer_counts[3], planes=512, stride=2)
@@ -71,7 +71,7 @@ class ResNetV1(nn.Module):
         self.classifier = nn.Linear(512*4, num_classes)
 
     def _make_layer(self, num_blocks, planes, stride):
-        layers = nn.Modulelist()
+        layers = []
         downsample = None
 
         if stride != 1 or self.in_planes != planes*4:
@@ -88,9 +88,9 @@ class ResNetV1(nn.Module):
         )
         self.in_planes = planes * 4
         for _ in range(num_blocks - 1):
-            layers.append(ResV1Block(self.in_planes, plane))
+            layers.append(ResV1Block(self.in_planes, planes))
 
-        return layers
+        return nn.Sequential(*layers)
 
     def forward(self, x):
         x = self.conv1(x)
