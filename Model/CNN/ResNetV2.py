@@ -1,7 +1,7 @@
 import torch
 from torch import nn
 
-class ResV2Block(nn.Module):
+class ResNetV2Block(nn.Module):
     def __init__(self, in_planes, planes, mid_conv_stride=1, downsample=None, residual=True):
         super().__init__()
 
@@ -15,7 +15,7 @@ class ResV2Block(nn.Module):
         self.bn1 = nn.BatchNorm2d(planes)
         self.relu1 = nn.ReLU()
 
-        self.conv2 = nn.Conv2d(planes, planes, kernel_size=3, stride=mid_conv_stride, bias=False)
+        self.conv2 = nn.Conv2d(planes, planes, kernel_size=3, stride=mid_conv_stride, padding=1, bias=False)
         self.bn2 = nn.BatchNorm2d(planes)
         self.relu2 = nn.ReLU()
 
@@ -39,7 +39,7 @@ class ResV2Block(nn.Module):
 
         if self.residual:
             if self.downsample is not None:
-                identity = self.downsample
+                identity = self.downsample(identity)
             x += identity
         return x
 
@@ -59,7 +59,7 @@ class ResNetV2(nn.Module):
         self.layer3 = self._make_layer(layer_counts[2], planes=256, stride=2)
         self.layer4 = self._make_layer(layer_counts[3], planes=512, stride=2)
 
-        self.avgpool = nn.AdativeAvgPool2d(1)
+        self.avgpool = nn.AdaptiveAvgPool2d(1)
         self.classifier = nn.Linear(512*4, num_classes)
 
     def _make_layer(self, num_blocks, planes, stride):
@@ -68,7 +68,7 @@ class ResNetV2(nn.Module):
 
         if stride != 1 or self.in_planes != planes * 4:
             downsample = nn.Sequential(
-                nn.Conv2d(self.in_planes, planes*4, kernel_size=1, stride=stride),
+                nn.Conv2d(self.in_planes, planes*4, kernel_size=1, stride=stride, bias=False),
                 nn.BatchNorm2d(planes*4)
             )
 
