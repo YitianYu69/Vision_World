@@ -2,7 +2,7 @@ import torch
 from torch import nn
 
 class ResV2Block(nn.Module):
-    def __init__(self, in_planes, planes, mid_conv_stride, downsample=None, residual=True):
+    def __init__(self, in_planes, planes, mid_conv_stride=1, downsample=None, residual=True):
         super().__init__()
 
         self.residual = residual
@@ -42,3 +42,55 @@ class ResV2Block(nn.Module):
                 identity = self.downsample
             x += identity
         return x
+
+
+class ResNetV2(nn.Module):
+    def __init__(self, num_classes, layer_counts):
+        super().__init__()
+        self.in_planes = 64
+
+        self.conv1 = nn.Conv2d(3, self.in_planes, kernel_size=7, stride=2, padding=3, bias=False)
+        self.bn1 = nn.BatchNorm2d(self.in_planes)
+        self.relu1 = nn.ReLU()
+        self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
+
+        self.layer1 = self._make_layer(layer_counts[0], planes=64, stride=1)
+        self.layer2 = self._make_layer(layer_counts[1], planes=128, stride=2)
+        self.layer3 = self._make_layer(layer_counts[2], planes=256, stride=2)
+        self.layer4 = self._make_layer(layer_counts[3], planes=512, stride=2)
+
+        self.avgpool = nn.AdativeAvgPool2d(1)
+        self.classifier = nn.Linear(512*4, num_classes)
+
+    def _make_layer(self, num_blocks, planes, stride):
+        downsample = None
+        layers = []
+
+        if stride != 1 or self.in_planes != planes * 4:
+            downsample = nn.Sequential(
+                nn.Conv2d(self.in_planes, planes*4, kernel_size=1, stride=stride),
+                nn.BatchNorm2d(planes*4)
+            )
+
+        layers.append(ResNetV2Block(self.in_planes, planes, mid_conv_stride=stride,
+                                    downsample=downsample))
+
+        self.in_planes = planes * 4
+        for _ in range(num_blocks - 1):
+            layers.append(ResNetV2Block(self.in_planes, planes))
+        return nn.Sequential(*layers)
+
+    def forward(self, x):
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = self.relu1(x)
+        x = self.maxpool(x)
+
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.layer3(x)
+        x = self.layer4(x)
+
+        x = self.avgpool(x)
+        x = x.view(x.size(0), -1)
+        return self.classifier(x)
