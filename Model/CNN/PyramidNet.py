@@ -2,6 +2,12 @@ import torch
 from torch import nn
 
 
+# -----------------------------------------------------------------
+# This ResNetV1 model implemented according to the Paper:
+# arXiv:1610.02915 - Deep Pyramidal Residual Networks
+# -----------------------------------------------------------------
+
+
 class PyramidNetBlock(nn.Module):
     def __init__(self, in_planes, planes, mid_conv_stride=1, downsample=None, residual=True):
         super().__init__()
