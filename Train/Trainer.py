@@ -17,6 +17,7 @@ class Trainer():
     def __init__(self, 
                  *,
                  model: nn.Module,
+                 teacher_model: nn.Module = None,
                  compile_type: str = None,
                  DS_config: Dict = None,
                  DDP_config: Dict = None,
@@ -42,6 +43,7 @@ class Trainer():
         self.grad_acc_step = grad_acc_step
         self.amp_enable = amp_enable
         self.device = device
+        self.teacher_model = teacher_model
         
         # Avoid multiple dist function call
         rank0 = dist.get_rank() == 0
@@ -49,6 +51,10 @@ class Trainer():
         # If using CUDA, move model to device first!
         if self.device != 'cpu':
             model.to(device)
+            if teacher is not None:
+                teacher_model.to(device).eval()
+                for p in teacher_model.parameters():
+                    p.requires_grad = False
         
         # Check for compile
         if compile_type is not None:
@@ -57,6 +63,10 @@ class Trainer():
             if (DS_config is not None or DDP_config is not None) and compile_type != 'reduce-overhead' and rank0:
                 logger.info("""For the max speed optimization, recommand to enable reduce-overhead compile mode
                             to avoid rebuild autograd graph!""")
+            if teacher_model is not None:
+                teacher_model.compile(fullgraph=fullgraph, mode=compile_type)
+                self.teacher_model = teacher_model
+            
 
         # ---------------------------------------------
         # Wrap model to enable different optimization
@@ -111,9 +121,13 @@ class Trainer():
         return t
 
     def _training_step(self, data, target):
+        if self.teacher_model is not None:
+            with torch.inference_mode():
+                teacher_logits = self.teacher_model(data)
+
         if self._is_deepspeed():
             logits = self.engine(data)
-            loss = self.cri(logits, target)
+            loss = self.cri(logits, target) if self.teacher_model is None else loss = self.cri(logits, target, teacher_logits)
             self.engine.backward(loss)
             self.engine.step()
         else:
@@ -121,7 +135,7 @@ class Trainer():
             device_type = "cuda" if str(self.device).startswith("cuda") else "cpu"
             with torch.autocast(device_type=device_type, dtype=self.cast_dtype, enabled=self.amp_enable):
                 logits = self.engine(data)
-                loss = self.cri(logits, target)
+                loss = self.cri(logits, target) if self.teacher_model is None else loss = self.cri(logits, target, teacher_logits)
             
             if self.scaler is not None:
                 self.scaler.scale(loss).backward()
