@@ -1,8 +1,28 @@
 import torch
+from torch import nn
+from torch.utils.data import Dataset, DataLoader, Subset
+
 from torchmetrics import Metric, Accuracy, Recall, Precision, F1Score, AUROC
 
 import math
-from typing import List, Union
+from typing import List, Union, Callable
+
+def warmup(model: nn.Module,
+           criterion: Callable,
+           dataset: Dataset, 
+           sub_data_portion: float,
+           device: str):
+    data = Subset(dataset, len(dataset) * sub_data_portion)
+    dl = DataLoader(data, batch_size=32, shuffle=True, num_workers=2, pin_memory=True, persistent_workers=True)
+    model = model.to(device)
+
+    for images, labels in dl:
+        images, labels = images.to(device, non_blocking=True), labels.to(device, non_blocking=True)
+
+        logits = model(images)
+        loss = criterion(logits, labels)
+        loss.backward()
+
 
 def build_metrics(*, metric_lists: List[str],
                   task:str,
