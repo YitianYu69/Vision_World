@@ -148,8 +148,8 @@ class Trainer():
                 torch.nn.utils.clip_grad_norm_(self.engine.parameters(), max_norm=1.0)
                 self.opt.step()
         
-        if self.ema is not None:
-            self.ema.update_parameters(self.engine)
+        self.scheduler.step() if self.scheduler is not None
+        self.ema.update_parameters(self.engine) if self.ema is not None
         return logits, loss
 
     @torch.no_grad()
