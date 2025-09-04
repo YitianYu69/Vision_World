@@ -1,6 +1,11 @@
 import torch
 from torch import nn
 
+# -----------------------------------------------------------------
+# This MobileNetV2 model implemented according to the Paper:
+# arXiv:1801.04381 - MobileNetV2: Inverted Residuals and Linear Bottlenecks
+# -----------------------------------------------------------------
+
 def make_divisible(value, divisor, min_value=None):
     if min_value is None:
         min_value = divisor 
