@@ -21,6 +21,7 @@ class Trainer():
                  compile_type: str = None,
                  DS_config: Dict = None,
                  DDP_config: Dict = None,
+                 CUDA_Graoh: bool = False,
                  criterion: Union[nn.Module, Callable] = None,
                  optimizer: Optional[torch.optim.Optimizer] = None,
                  scheduler: Optional[torch.optim.lr_scheduler._LRScheduler] = None, 
@@ -33,6 +34,7 @@ class Trainer():
                  device: Union[str, torch.device] = 'cpu'):
         self.DS_config = DS_config
         self.DDP_config = DDP_config
+        self.CUDA_Graph = CUDA_Graph
         self.cri = criterion
         self.opt = optimizer
         self.sch = scheduler
@@ -71,35 +73,14 @@ class Trainer():
         # ---------------------------------------------
         # Wrap model to enable different optimization
         # ---------------------------------------------
-        if self.DS_config is not None:
-            self.engine, _ = deepspeed.initialize(
-                model=model,
-                model_parameters=model.parameters(),
-                config=DS_config
-            )
-        elif self.DDP_config is not None:
-            if dist.is_available() and dist.is_initialized() and rank0 and self.DDP_config['broadcast_buffers']:
-                logger.info(f'Please turn off the broadcast_buffers, if you used the torch.nn.SyncBatchNorm.convert_sycn_batchnorm()')
-            if dist.is_available() and dist.is_initialized() and rank0 and self.DDP_config['gradient_as_bucket_view']:
-                logger.info(f'Please turn on the set_to_none for your optimizaer.zer_grad()! If you do not, then your DDP grad bucket will be zeroed out!')
-
-            model.to(device)
-
-            ddp_kwargs = dict(
-                static_graph=self.DDP_config.get('static_graph', False),
-                broadcast_buffers=self.DDP_config.get('broadcast_buffers', True),
-                bucket_cap_mb=self.DDP_config.get('bucket_cap_mb', 25),
-                find_unused_parameters=self.DDP_config.get('find_unused_parameters', False),
-                gradient_as_bucket_view=self.DDP_config.get('gradient_as_bucket_view', False),
-            )
-
-            self.engine = DDP(
-                model,
-                device_ids=self.DDP_config.get('device_ids'),
-                **ddp_kwargs)
+        if not self.CUDA_Graph:
+            self.engine = self._wrap_model_to_engine(model)
         else:
-            self.engine = model
-
+            logger.info("CUDA Graph Enabled!")
+            side = torch.cuda.Stream(device=device)
+            side.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.Stream(side):
+                self.engine = self._wrap_model_to_engine(model)
         # ---------------------------------------------------
         # If TP2 AMP enabled, auto check the best cast dtype
         # ---------------------------------------------------
@@ -120,6 +101,40 @@ class Trainer():
             dist.all_reduce(t, op=dist.ReduceOp.SUM)
         return t
 
+    def _wrap_model_to_engine(self, model, wrap_type='raw'):
+        if self.DS_config is not None:
+            engine, _ = deepspeed.initialize(
+                model=model,
+                model_parameters=model.parameters(),
+                config=DS_config
+            )
+            logger.info("Model Wrap Type: DeepSpeed!")
+        elif self.DDP_config is not None:
+            if dist.is_available() and dist.is_initialized() and rank0 and self.DDP_config['broadcast_buffers']:
+                logger.info(f'Please turn off the broadcast_buffers, if you used the torch.nn.SyncBatchNorm.convert_sycn_batchnorm()')
+            if dist.is_available() and dist.is_initialized() and rank0 and self.DDP_config['gradient_as_bucket_view']:
+                logger.info(f'Please turn on the set_to_none for your optimizaer.zer_grad()! If you do not, then your DDP grad bucket will be zeroed out!')
+
+            model.to(device)
+
+            ddp_kwargs = dict(
+                static_graph=self.DDP_config.get('static_graph', False),
+                broadcast_buffers=self.DDP_config.get('broadcast_buffers', True),
+                bucket_cap_mb=self.DDP_config.get('bucket_cap_mb', 25),
+                find_unused_parameters=self.DDP_config.get('find_unused_parameters', False),
+                gradient_as_bucket_view=self.DDP_config.get('gradient_as_bucket_view', False),
+            )
+
+            engine = DDP(
+                model,
+                device_ids=self.DDP_config.get('device_ids'),
+                **ddp_kwargs)
+            logger.info("Model Wrap Type: DDP")
+        else:
+            logger.info("Model Wrap Type: Raw")
+
+        return model
+
     def _training_step(self, data, target):
         if self.teacher_model is not None:
             with torch.inference_mode():
@@ -136,9 +151,13 @@ class Trainer():
             with torch.autocast(device_type=device_type, dtype=self.cast_dtype, enabled=self.amp_enable):
                 logits = self.engine(data)
                 loss = self.cri(logits, target) if self.teacher_model is None else loss = self.cri(logits, target, teacher_logits)
-            
-            if self.scaler is not None:
-                self.scaler.scale(loss).backward()
+                
+                if self.amp_enable and self.scaler is not None:
+                    self.scaler.scale(loss).backward()
+                else:
+                    loss.backward()
+
+            if self.amp_enable and self.scaler is not None:
                 self.scaler.unscale_(self.opt)
                 torch.nn.utils.clip_grad_norm_(self.engine.parameters(), max_norm=1.0)
                 self.scaler.step(self.opt)
