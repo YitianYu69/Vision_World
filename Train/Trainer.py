@@ -93,6 +93,11 @@ class Trainer():
         else:
             self.cast_dtype = None
 
+    def train(self, dataloader, epoch):
+        return self._training(dataloader, epoch)
+    def valid(self, dataloader):
+        return self._validation(dataloader)
+
     def _is_deepspeed(self):
         return isinstance(self.engine, deepspeed.DeepSpeedEngine)
 
@@ -179,7 +184,7 @@ class Trainer():
                 v.update(logits.argmax(dim=1), target)
 
 
-    def _training_ds(self,
+    def _training(self,
                  dataloader: DataLoader,
                  epoch: int):
         total_loss, data_len = torch.tensor(0.0, dtype=torch.float32, device=self.device), torch.tensor(0, dtype=torch.long, device=self.device)
@@ -216,8 +221,7 @@ class Trainer():
 
     @torch.no_grad()
     def _validation(self,
-                    dataloader: DataLoader,
-                    epoch: int):
+                    dataloader: DataLoader):
         total_loss, data_len = torch.tensor(0.0, dtype=torch.float32, device=self.device), torch.tensor(0, dtype=torch.long, device=self.device)
         computed_metrics = {}
 
