@@ -4,32 +4,87 @@ from torch.utils.data import Dataset, DataLoader, Subset
 
 from torchmetrics import Metric, Accuracy, Recall, Precision, F1Score, AUROC
 
+import logging
+
 import math
 from typing import List, Union, Callable
 
+logger = logging.getLogger(__name__)
+
 def warmup(model: nn.Module,
-           criterion: Callable,
+           criterion: nn.Module,
            dataset: Dataset, 
            sub_data_portion: float,
            device: str):
-    data = Subset(dataset, len(dataset) * sub_data_portion)
-    dl = DataLoader(data, batch_size=32, shuffle=True, num_workers=2, pin_memory=True, persistent_workers=True)
+    model.train()
+    n = range(int(len(dataset) * sub_data_portion))
+    data = Subset(dataset, n)
+    dl = DataLoader(data, batch_size=32, shuffle=True, drop_last=True, num_workers=2, pin_memory=True, persistent_workers=True)
     model = model.to(device)
 
     for images, labels in dl:
         images, labels = images.to(device, non_blocking=True), labels.to(device, non_blocking=True)
 
+        model.zero_grad(set_to_none=True)
         logits = model(images)
         loss = criterion(logits, labels)
         loss.backward()
+    if torch.cuda.is_available() and str(device).startswith('cuda'):
+        torch.cuda.synchronize()
+    model.zero_grad(set_to_none=True)
 
+def prefetch(dataloader: DataLoader):
+    it = iter(dataloader)
+
+    try:
+        return next(it)
+    except StopIteration:
+        raise RuntimeError("Prefetch failed, dataloader is empty!")
+
+
+def build_CUDA_Graph(model: nn.Module,
+                     criterion: nn.Module,
+                     dataloader: DataLoader,
+                     amp_enable: bool = False,
+                     dtype: torch.dtype = torch.float32,
+                     device: str = 'cuda',
+                     scaler: torch.amp.GradScaler = None):
+    device = torch.device(device)
+    cpu_x, cpu_y = prefetch(dataloader)
+    cuda_x, cuda_y = cpu_x.to(device, non_blocking=True), cpu_y.to(device, non_blocking=True)
+    static_x = torch.empty_like(cuda_x)
+    static_y = torch.empty_like(cuda_y)
+    static_x.copy_(cuda_x); static_y.copy_(cuda_y)
+    compute_stream = torch.cuda.Stream(device=device)
+
+    g = torch.cuda.CUDAGraph()
+    if amp_enable and dtype == torch.float16:
+        logger.info("Warning: with CUDA Graph and float16, please freeze the AMP!")
+
+    model.train()
+    model.zero_grad(set_to_none=True)
+    with torch.cuda.stream(compute_stream):
+        if amp_enable:
+            with torch.cuda.graph(g):
+                with torch.amp.autocast(device_type='cuda', dtype=dtype):
+                    logits = model(static_x)
+                    loss = criterion(logits, static_y)
+                    scaler.scale(loss).backward() if scaler is not None else loss.backward()
+        else:
+            with torch.cuda.graph(g):
+                logits = model(static_x)
+                loss = criterion(logits, static_y)
+                loss.backward()
+    
+    return g, static_x, static_y, logits, loss, compute_stream
+    
 
 def build_metrics(*, metric_lists: List[str],
                   task:str,
                   num_classes: int,
                   average_type: str,
                   sync: bool,
-                  Union[str, torch.device] = "cpu"):
+                  device: Union[str, torch.device] = "cpu"):
     kwargs = dict(task=task, num_classes=num_classes, average=average_type, sync_on_compute=sync)
 
     metrics = {
