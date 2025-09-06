@@ -1,6 +1,8 @@
 import torch
 from torch import nn
 from torch.utils.data import Dataset, DataLoader, Subset
+import torch.nn.functional as F
+from torch.nn import CrossEntropyLoss, KLDivLoss
 
 from torchmetrics import Metric, Accuracy, Recall, Precision, F1Score, AUROC
 
@@ -27,8 +29,9 @@ def warmup(model: nn.Module,
 
         model.zero_grad(set_to_none=True)
         logits = model(images)
-        loss = criterion(logits, labels)
+        loss = criterion(logits, labels=labels)
         loss.backward()
+
     if torch.cuda.is_available() and str(device).startswith('cuda'):
         torch.cuda.synchronize()
     model.zero_grad(set_to_none=True)
@@ -48,13 +51,40 @@ def build_CUDA_Graph(model: nn.Module,
                      amp_enable: bool = False,
                      dtype: torch.dtype = torch.float32,
                      device: str = 'cuda',
-                     scaler: torch.amp.GradScaler = None):
+                     scaler: torch.amp.GradScaler = None,
+                     mode: str = 'default'):
+
+    if hasattr(criterion, "graph_mode"):
+        criterion.graph_mode = True
+                
     device = torch.device(device)
     cpu_x, cpu_y = prefetch(dataloader)
     cuda_x, cuda_y = cpu_x.to(device, non_blocking=True), cpu_y.to(device, non_blocking=True)
+
     static_x = torch.empty_like(cuda_x)
-    static_y = torch.empty_like(cuda_y)
-    static_x.copy_(cuda_x); static_y.copy_(cuda_y)
+    static_x.copy_(cuda_x)
+
+    ctype = criterion.criterion_type
+    if ctype == 'CE':
+        criterion.ensure_buffers_once(labels=cuda_y)
+        criterion.set_batch_target(labels=cuda_y)
+    elif ctype == 'Mixup_Cutmix':
+        lam0 = torch.tensor(1.0, dtype=torch.float32, device=device)
+        criterion.ensure_buffers_once(y_a=cuda_y, y_b=cuda_y, lam=lam0)
+        criterion.set_batch_target(y_a=cuda_y, y_b=cuda_y, lam=lam0)
+    elif ctype == 'KD':
+        with torch.inference_mode():
+            out = model(static_x)
+        if not isinstance(out, tuple):
+            raise RuntimeError('Criterion expects the logits in tuple!')
+        _,  logits_kd = out
+        if logits_kd.ndim != 2:
+            raise RuntimeError(f'KD now only accepts head shape [B, C], got {logits_kd.size()} instead')
+        teacher_seed = torch.zeros_like(logits_kd, dtype=criterion.compute_dtype, device=device)
+        criterion.ensure_buffers_once(labels=cuda_y, teacher_logits=teacher_seed)
+        criterion.set_batch_target(labels=cuda_y, teacher_logits=teacher_seed)
+    else:
+        raise ValueError(f"Unknown criterion type: {ctype}!")
     compute_stream = torch.cuda.Stream(device=device)
 
     g = torch.cuda.CUDAGraph()
@@ -68,15 +98,108 @@ def build_CUDA_Graph(model: nn.Module,
             with torch.cuda.graph(g):
                 with torch.amp.autocast(device_type='cuda', dtype=dtype):
                     logits = model(static_x)
-                    loss = criterion(logits, static_y)
+                    loss = criterion(logits)
                     scaler.scale(loss).backward() if scaler is not None else loss.backward()
         else:
             with torch.cuda.graph(g):
                 logits = model(static_x)
-                loss = criterion(logits, static_y)
+                loss = criterion(logits)
                 loss.backward()
     
-    return g, static_x, static_y, logits, loss, compute_stream
+    return g, static_x, logits, loss, compute_stream
+
+
+
+class setup_criterion(nn.Module):
+    def __init__(self, *, labels=None, label_smoothing=None, criterion_type='default', graph_mode=False,
+                 y_a=None, y_b=None, lam=None,
+                 temperature=None, alpha_kd=0.5, teacher_logits=None, amp=None):
+        super().__init__()
+
+        if criterion_type == 'KD':
+            assert temperature is not None, 'Variable temperature cannot be None!'
+            self.T2 = temperature * temperature
+        
+        self.alpha_kd = alpha_kd
+        self.temperature = temperature
+        self.criterion_type = criterion_type
+
+        if amp == "fp16":
+            self.compute_dtype = torch.float16
+        elif amp == "bf16":
+            self.compute_dtype = torch.bfloat16
+        else:
+            self.compute_dtype = torch.float32
+
+        self.ce = CrossEntropyLoss(label_smoothing=label_smoothing) if label_smoothing else CrossEntropyLoss()
+        self.kl = KLDivLoss(reduction='batchmean', log_target=True)
+
+        # Setting up buffers for graph mode:
+        self.graph_mode = graph_mode
+        if self.graph_mode:
+            self.register_buffer('label_buf', None, persistent=False)
+            self.register_buffer('y_a_buf', None, persistent=False)
+            self.register_buffer('y_b_buf', None, persistent=False)
+            self.register_buffer('lam_buf', None, persistent=False)
+            self.register_buffer('teacher_logits_buf', None, persistent=False)
+            logger.info('Graph Mode turned on!')
+            
+    def _ce(self, logits, *, labels):
+        return self.ce(logits, labels)
+   
+    def _mc(self, logits, *, y_a, y_b, lam):
+        logp = F.log_softmax(logits, dim=1)
+        loss_a = -logp.gather(1, y_a.view(-1, 1)).squeeze(1)
+        loss_b = -logp.gather(1, y_b.view(-1, 1)).squeeze(1)
+        return (loss_a.mul_(lam).add_(loss_b, alpha=(1 - lam))).mean()
+
+    def _kd(self, logits, *, labels, teacher_logits):
+        assert isinstance(logits, tuple), 'Please use a tuple of logits'
+        logits, logits_kd = logits
+        log_p_s = F.log_softmax(logits_kd.float() / self.temperature, dim=1)
+        q_s = F.log_softmax(teacher_logits.float() / self.temperature, dim=1)
+        soft_loss = self.kl(log_p_s, q_s) * self.T2
+        hard_loss = self.ce(logits, labels)
+        return soft_loss.mul_(self.alpha_kd).add_(hard_loss, alpha=(1 - self.alpha_kd))
+
+    @torch.no_grad()
+    def ensure_buffers_once(self, *, labels=None, y_a=None, y_b=None, lam=None, teacher_logits=None):
+        if self.criterion_type == 'CE' and labels is not None:
+            self.label_buf = torch.empty_like(labels, dtype=torch.long, device=labels.device)
+        elif self.criterion_type == 'Mixup_Cutmix' and None not in [y_a, y_b, lam]:
+            self.y_a_buf = torch.empty_like(y_a, dtype=torch.long, device=y_a.device)
+            self.y_b_buf = torch.empty_like(y_b, dtype=torch.long, device=y_b.device)
+            self.lam_buf = torch.empty_like(lam, dtype=torch.float32, device=lam.device)
+        elif self.criterion_type == 'KD' and labels is not None and teacher_logits is not None:
+            self.teacher_logits_buf = torch.empty_like(teacher_logits, dtype=self.compute_dtype, device=teacher_logits.device)
+            self.label_buf = torch.empty_like(labels, dtype=torch.long, device=labels.device)
+
+    @torch.no_grad()
+    def set_batch_target(self, *, labels=None, y_a=None, y_b=None, lam=None, teacher_logits=None):
+        if labels is not None: self.label_buf.copy_(labels)
+        if None not in [y_a, y_b, lam]:
+            self.y_a_buf.copy_(y_a)
+            self.y_b_buf.copy_(y_b)
+            self.lam_buf.copy_(lam)
+        if teacher_logits is not None: self.teacher_logits_buf.copy_(teacher_logits)
+
+    def forward(self, logits, *, labels=None, y_a=None, y_b=None, lam=None, teacher_logits=None):
+        if self.graph_mode:
+            if self.criterion_type == 'CE':
+                return self._ce(logits, labels=self.label_buf)
+            elif self.criterion_type == 'Mixup_Cutmix':
+                return self._mc(logits, y_a=self.y_a_buf, y_b=self.y_b_buf, lam=self.lam_buf)
+            elif self.criterion_type == 'KD':
+                return self._kd(logits, labels=self.label_buf, teacher_logits=self.teacher_logits_buf)
+        else:
+            if self.criterion_type == 'CE':
+                return self._ce(logits, labels=labels)
+            elif self.criterion_type == 'Mixup_Cutmix':
+                return self._mc(logits, y_a=y_a, y_b=y_b, lam=lam)
+            elif self.criterion_type == 'KD':
+                return self._kd(logits, labels=labels, teacher_logits=teacher_logits)
+            
+
     
 
 def build_metrics(*, metric_lists: List[str],
