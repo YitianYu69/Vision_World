@@ -10,8 +10,13 @@ from torchmetrics import Metric
 
 import deepspeed
 
+import logging
+from utils_train import warmup, build_CUDA_Graph
+
 import time
 from typing import Union, Callable, Dict, Optional
+
+logger = logging.getLogger(__name__)
 
 class Trainer():
     def __init__(self, 
@@ -21,80 +26,97 @@ class Trainer():
                  compile_type: str = None,
                  DS_config: Dict = None,
                  DDP_config: Dict = None,
-                 CUDA_Graoh: bool = False,
+                 CUDA_Graph: bool = False,
+                 dataloader: DataLoader = None,
+                 sub_data_portion: float = 1.0,
                  criterion: Union[nn.Module, Callable] = None,
                  optimizer: Optional[torch.optim.Optimizer] = None,
                  scheduler: Optional[torch.optim.lr_scheduler._LRScheduler] = None, 
                  scaler: torch.amp.GradScaler = None,
-                 metrics: Dict[str, Metric],
+                 metrics: Dict[str, Metric] = None,
                  ema: Callable = None,
-                 num_epochs: int,
+                 num_epochs: int = 200,
                  grad_acc_step: int = 1,
                  amp_enable: bool = True,
                  device: Union[str, torch.device] = 'cpu'):
         self.DS_config = DS_config
         self.DDP_config = DDP_config
         self.CUDA_Graph = CUDA_Graph
+        self.train_dataloader = dataloader
         self.cri = criterion
         self.opt = optimizer
-        self.sch = scheduler
+        self.scheduler = scheduler
         self.scaler = scaler
         self.metrics = metrics
         self.ema = ema
         self.num_epochs = num_epochs
         self.grad_acc_step = grad_acc_step
         self.amp_enable = amp_enable
-        self.device = device
+        self.device = device.type if isinstance(device, torch.device) else device
         self.teacher_model = teacher_model
         
         # Avoid multiple dist function call
-        rank0 = dist.get_rank() == 0
+        self.rank0 = (dist.is_available() and dist.is_initialized() and dist.get_rank() == 0)
 
         # If using CUDA, move model to device first!
         if self.device != 'cpu':
             model.to(device)
-            if teacher is not None:
+            if teacher_model is not None:
                 teacher_model.to(device).eval()
                 for p in teacher_model.parameters():
                     p.requires_grad = False
+                self.teacher_model = teacher_model
         
         # Check for compile
         if compile_type is not None:
-            fullgraph = False if DS_config is not None else True
+            fullgraph = False if self.DS_config is not None else True
             model.compile(fullgraph=fullgraph, mode=compile_type)
-            if (DS_config is not None or DDP_config is not None) and compile_type != 'reduce-overhead' and rank0:
-                logger.info("""For the max speed optimization, recommand to enable reduce-overhead compile mode
-                            to avoid rebuild autograd graph!""")
+            if (self.DS_config is not None or self.DDP_config is not None) and compile_type != 'reduce-overhead' and self.rank0:
+                logger.info("""For the max speed optimization, consider enabling reduce-overhead compile mode
+                            to avoid rebuilding autograd graph!""")
             if teacher_model is not None:
                 teacher_model.compile(fullgraph=fullgraph, mode=compile_type)
                 self.teacher_model = teacher_model
-            
 
-        # ---------------------------------------------
-        # Wrap model to enable different optimization
-        # ---------------------------------------------
-        if not self.CUDA_Graph:
-            self.engine = self._wrap_model_to_engine(model)
-        else:
-            logger.info("CUDA Graph Enabled!")
-            side = torch.cuda.Stream(device=device)
-            side.wait_stream(torch.cuda.current_stream())
-            with torch.cuda.Stream(side):
-                self.engine = self._wrap_model_to_engine(model)
+
         # ---------------------------------------------------
         # If TP2 AMP enabled, auto check the best cast dtype
         # ---------------------------------------------------
-        if not self._is_deepspeed() and amp_enable:
+        if self.DS_config is None and amp_enable and self.device.startswith('cuda'):
             major, _ = torch.cuda.get_device_capability(torch.device(device))
             self.cast_dtype = torch.bfloat16 if major >= 8 and torch.cuda.is_available() else torch.float16
 
             if self.cast_dtype == torch.float16 and scaler is None:
                 raise ValueError(f"AMP float16 is enabled, then the scaler cannot be None!")
+        elif self.DS_config is None and amp_enable and self.device.startswith('cpu'):
+            self.cast_dtype = torch.bfloat16
         else:
             self.cast_dtype = None
+            
 
-    def train(self, dataloader, epoch):
-        return self._training(dataloader, epoch)
+        # ---------------------------------------------
+        # Wrap model to enable different optimization
+        # ---------------------------------------------
+        if self.CUDA_Graph and self.DS_config is None:
+            logger.info("CUDA Graph Enabled!")
+            side = torch.cuda.Stream(device=device)
+            side.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.Stream(side):
+                self.engine = self._wrap_model_to_engine(model)
+            logger.info("CUDA Graph Warmup!")
+            warmup(self.engine, self.cri, self.train_dataloader.dataset, sub_data_portion, device)
+            (self.graph_engine, self.static_x, self.static_y, self.static_logits, self.static_loss, self.compute_stream) = build_CUDA_Graph(self.engine, 
+                                                                                                                                            self.cri, self.train_dataloader, 
+                                                                                                                                            self.amp_enable, self.cast_dtype, 
+                                                                                                                                            self.device, self.scaler)
+            self.copy_stream = torch.cuda.Stream(device=device)
+            self.copy_event = torch.cuda.Event()
+        else:
+            self.engine = self._wrap_model_to_engine(model)
+
+
+    def train(self, epoch):
+        return self._training(epoch)
     def valid(self, dataloader):
         return self._validation(dataloader)
 
@@ -107,20 +129,19 @@ class Trainer():
         return t
 
     def _wrap_model_to_engine(self, model, wrap_type='raw'):
+        model.to(self.device)
         if self.DS_config is not None:
             engine, _ = deepspeed.initialize(
                 model=model,
                 model_parameters=model.parameters(),
-                config=DS_config
+                config=self.DS_config
             )
             logger.info("Model Wrap Type: DeepSpeed!")
         elif self.DDP_config is not None:
-            if dist.is_available() and dist.is_initialized() and rank0 and self.DDP_config['broadcast_buffers']:
-                logger.info(f'Please turn off the broadcast_buffers, if you used the torch.nn.SyncBatchNorm.convert_sycn_batchnorm()')
-            if dist.is_available() and dist.is_initialized() and rank0 and self.DDP_config['gradient_as_bucket_view']:
-                logger.info(f'Please turn on the set_to_none for your optimizaer.zer_grad()! If you do not, then your DDP grad bucket will be zeroed out!')
-
-            model.to(device)
+            if dist.is_available() and dist.is_initialized() and self.rank0 and self.DDP_config.get('broadcast_buffers', True):
+                logger.info('Please turn off the broadcast_buffers if you used the torch.nn.SyncBatchNorm.convert_sync_batchnorm().')
+            if dist.is_available() and dist.is_initialized() and self.rank0 and self.DDP_config.get('gradient_as_bucket_view', False):
+                logger.info('Please set set_to_none=True for optimizer.zero_grad(); otherwise DDP grad buckets may be zeroed out.')
 
             ddp_kwargs = dict(
                 static_graph=self.DDP_config.get('static_graph', False),
@@ -136,9 +157,10 @@ class Trainer():
                 **ddp_kwargs)
             logger.info("Model Wrap Type: DDP")
         else:
+            engine = model
             logger.info("Model Wrap Type: Raw")
 
-        return model
+        return engine
 
     def _training_step(self, data, target):
         if self.teacher_model is not None:
@@ -152,16 +174,39 @@ class Trainer():
             self.engine.step()
         else:
             self.opt.zero_grad(set_to_none=True)
-            device_type = "cuda" if str(self.device).startswith("cuda") else "cpu"
-            with torch.autocast(device_type=device_type, dtype=self.cast_dtype, enabled=self.amp_enable):
-                logits = self.engine(data)
-                loss = self.cri(logits, target) if self.teacher_model is None else self.cri(logits, target, teacher_logits)
-                
-                if self.amp_enable and self.scaler is not None:
-                    self.scaler.scale(loss).backward()
-                else:
-                    loss.backward()
+            # Branch using CUDA Graph or not
+            if not self.CUDA_Graph:
+                device_type = "cuda" if str(self.device).startswith("cuda") else "cpu"
+                with torch.autocast(device_type=device_type, 
+                                    dtype=(self.cast_dtype if device_type in ['cuda', 'cpu'] else None),
+                                    enabled=self.amp_enable and device_type in ['cuda', 'cpu']):
+                    logits = self.engine(data)
+                    loss = self.cri(logits, target) if self.teacher_model is None else self.cri(logits, target, teacher_logits)
+                    
+                    if self.amp_enable and self.scaler is not None:
+                        self.scaler.scale(loss).backward()
+                    else:
+                        loss.backward()
+            else:
+                if data.shape != self.static_x.shape or target.shape != self.static_y.shape:
+                    raise RuntimeError(
+                        f"CUDA Graph expects fixed shapes. "
+                        f"Got data {tuple(data.shape)} vs {tuple(self.static_x.shape)}, "
+                        f"target {tuple(target.shape)} vs {tuple(self.static_y.shape)}."
+                    )
 
+                with torch.cuda.stream(self.copy_stream):
+                    self.static_x.copy_(data, non_blocking=True)
+                    self.static_y.copy_(target, non_blocking=True)
+                    self.copy_event.record(self.copy_stream)
+
+                with torch.cuda.stream(self.compute_stream):
+                    self.compute_stream.wait_event(self.copy_event)
+                    self.graph_engine.replay()
+
+                logits = self.static_logits
+                loss = self.static_loss
+                
             if self.amp_enable and self.scaler is not None:
                 self.scaler.unscale_(self.opt)
                 torch.nn.utils.clip_grad_norm_(self.engine.parameters(), max_norm=1.0)
@@ -170,22 +215,26 @@ class Trainer():
             else:
                 torch.nn.utils.clip_grad_norm_(self.engine.parameters(), max_norm=1.0)
                 self.opt.step()
-        
-        self.scheduler.step() if self.scheduler is not None
-        self.ema.update_parameters(self.engine) if self.ema is not None
+
+        if self.scheduler is not None:
+            self.scheduler.step()
+        if self.ema is not None:
+            self.ema.update_parameters(self.engine)
         return logits, loss
 
     @torch.no_grad()
     def _update_metrics(self, logits, target):
         for k, v in self.metrics.items():
             if k == 'AUROC':
-                v.update(F.softmax(logits, dim=1), target)
+                if logits.ndim == 1 or (logits.ndim == 2 and logits.size(1) == 1):
+                    v.update(torch.sigmoid(logits), target)
+                else:
+                    v.update(F.softmax(logits, dim=1), target)
             else:
                 v.update(logits.argmax(dim=1), target)
 
 
     def _training(self,
-                 dataloader: DataLoader,
                  epoch: int):
         total_loss, data_len = torch.tensor(0.0, dtype=torch.float32, device=self.device), torch.tensor(0, dtype=torch.long, device=self.device)
         computed_metrics = {}
@@ -196,11 +245,11 @@ class Trainer():
         for v in self.metrics.values():
             v.reset()
 
-        if isinstance(dataloader.sampler, DistributedSampler) and self.DDP_config is not None:
-            dataloader.sampler.set_epoch(epoch)
+        if isinstance(self.train_dataloader.sampler, DistributedSampler):
+            self.train_dataloader.sampler.set_epoch(epoch)
 
         start_time = time.time()
-        for data, target in dataloader:
+        for data, target in self.train_dataloader:
             data, target = data.to(self.device, non_blocking=True), target.to(self.device, non_blocking=True)
 
             logits, loss = self._training_step(data, target)
