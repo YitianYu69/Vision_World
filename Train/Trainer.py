@@ -169,7 +169,7 @@ class Trainer():
 
         if self._is_deepspeed():
             logits = self.engine(data)
-            loss = self.cri(logits, target) if self.teacher_model is None else self.cri(logits, target, teacher_logits)
+            loss = self.cri(logits, labels=target) if self.teacher_model is None else self.cri(logits, labels=target, teacher_logits=teacher_logits)
             self.engine.backward(loss)
             self.engine.step()
         else:
@@ -181,7 +181,7 @@ class Trainer():
                                     dtype=(self.cast_dtype if device_type in ['cuda', 'cpu'] else None),
                                     enabled=self.amp_enable and device_type in ['cuda', 'cpu']):
                     logits = self.engine(data)
-                    loss = self.cri(logits, target) if self.teacher_model is None else self.cri(logits, target, teacher_logits)
+                    loss = self.cri(logits, labels=target) if self.teacher_model is None else self.cri(logits, labels=target, teacher_logits=teacher_logits)
                     
                     if self.amp_enable and self.scaler is not None:
                         self.scaler.scale(loss).backward()
@@ -197,7 +197,7 @@ class Trainer():
 
                 with torch.cuda.stream(self.copy_stream):
                     self.static_x.copy_(data, non_blocking=True)
-                    self.static_y.copy_(target, non_blocking=True)
+                    self.cri.set_batch_target(labels=labels) if self.teacher_model is None else self.cri.set_batch_target(labels, teacher_logits=teacher_logits)
                     self.copy_event.record(self.copy_stream)
 
                 with torch.cuda.stream(self.compute_stream):
