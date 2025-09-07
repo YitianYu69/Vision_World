@@ -52,7 +52,8 @@ def build_CUDA_Graph(model: nn.Module,
                      dtype: torch.dtype = torch.float32,
                      device: str = 'cuda',
                      scaler: torch.amp.GradScaler = None,
-                     mode: str = 'default'):
+                     mode: str = 'default',
+                     grad_acc_step: int = 1):
 
     if hasattr(criterion, "graph_mode"):
         criterion.graph_mode = True
@@ -66,12 +67,12 @@ def build_CUDA_Graph(model: nn.Module,
 
     ctype = criterion.criterion_type
     if ctype == 'CE':
-        criterion.ensure_buffers_once(labels=cuda_y)
-        criterion.set_batch_target(labels=cuda_y)
+        criterion.ensure_buffers_once(grad_acc_step=grad_acc_step, labels=cuda_y)
+        criterion.set_batch_target(grad_acc_step=grad_acc_step, labels=cuda_y)
     elif ctype == 'Mixup_Cutmix':
         lam0 = torch.tensor(1.0, dtype=torch.float32, device=device)
-        criterion.ensure_buffers_once(y_a=cuda_y, y_b=cuda_y, lam=lam0)
-        criterion.set_batch_target(y_a=cuda_y, y_b=cuda_y, lam=lam0)
+        criterion.ensure_buffers_once(grad_acc_step=grad_acc_step, labels=cuda_y, y_a=cuda_y, y_b=cuda_y, lam=lam0)
+        criterion.set_batch_target(grad_acc_step=grad_acc_step, labels=cuda_y, y_a=cuda_y, y_b=cuda_y, lam=lam0)
     elif ctype == 'KD':
         with torch.inference_mode():
             out = model(static_x)
@@ -81,8 +82,8 @@ def build_CUDA_Graph(model: nn.Module,
         if logits_kd.ndim != 2:
             raise RuntimeError(f'KD now only accepts head shape [B, C], got {logits_kd.size()} instead')
         teacher_seed = torch.zeros_like(logits_kd, dtype=criterion.compute_dtype, device=device)
-        criterion.ensure_buffers_once(labels=cuda_y, teacher_logits=teacher_seed)
-        criterion.set_batch_target(labels=cuda_y, teacher_logits=teacher_seed)
+        criterion.ensure_buffers_once(grad_acc_step=grad_acc_step, labels=cuda_y, teacher_logits=teacher_seed)
+        criterion.set_batch_target(grad_acc_step=grad_acc_step, labels=cuda_y, teacher_logits=teacher_seed)
     else:
         raise ValueError(f"Unknown criterion type: {ctype}!")
     compute_stream = torch.cuda.Stream(device=device)
@@ -98,15 +99,17 @@ def build_CUDA_Graph(model: nn.Module,
             with torch.cuda.graph(g):
                 with torch.amp.autocast(device_type='cuda', dtype=dtype):
                     logits = model(static_x)
-                    loss = criterion(logits)
+                    ori_loss = criterion(logits)
+                    loss = ori_loss / criterion.grad_acc_step_buf
                     scaler.scale(loss).backward() if scaler is not None else loss.backward()
         else:
             with torch.cuda.graph(g):
                 logits = model(static_x)
-                loss = criterion(logits)
+                ori_loss = criterion(logits)
+                loss = ori_loss / criterion.grad_acc_step_buf
                 loss.backward()
     
-    return g, static_x, logits, loss, compute_stream
+    return g, static_x, cuda_y, logits, ori_loss, compute_stream
 
 
 
@@ -142,6 +145,7 @@ class setup_criterion(nn.Module):
             self.register_buffer('y_b_buf', None, persistent=False)
             self.register_buffer('lam_buf', None, persistent=False)
             self.register_buffer('teacher_logits_buf', None, persistent=False)
+            self.register_buffer('grad_acc_step_buf', None, persistent=False)
             logger.info('Graph Mode turned on!')
             
     def _ce(self, logits, *, labels):
@@ -163,7 +167,8 @@ class setup_criterion(nn.Module):
         return soft_loss.mul_(self.alpha_kd).add_(hard_loss, alpha=(1 - self.alpha_kd))
 
     @torch.no_grad()
-    def ensure_buffers_once(self, *, labels=None, y_a=None, y_b=None, lam=None, teacher_logits=None):
+    def ensure_buffers_once(self, *, grad_acc_step, labels, y_a=None, y_b=None, lam=None, teacher_logits=None):
+        self.grad_acc_step_buf = torch.empty_like(torch.tensor(1.0, dtype=torch.float32, device=labels.device))
         if self.criterion_type == 'CE' and labels is not None:
             self.label_buf = torch.empty_like(labels, dtype=torch.long, device=labels.device)
         elif self.criterion_type == 'Mixup_Cutmix' and None not in [y_a, y_b, lam]:
@@ -175,7 +180,8 @@ class setup_criterion(nn.Module):
             self.label_buf = torch.empty_like(labels, dtype=torch.long, device=labels.device)
 
     @torch.no_grad()
-    def set_batch_target(self, *, labels=None, y_a=None, y_b=None, lam=None, teacher_logits=None):
+    def set_batch_target(self, *, grad_acc_step, labels=None, y_a=None, y_b=None, lam=None, teacher_logits=None):
+        self.grad_acc_step_buf.copy_(grad_acc_step)
         if labels is not None: self.label_buf.copy_(labels)
         if None not in [y_a, y_b, lam]:
             self.y_a_buf.copy_(y_a)
@@ -183,16 +189,16 @@ class setup_criterion(nn.Module):
             self.lam_buf.copy_(lam)
         if teacher_logits is not None: self.teacher_logits_buf.copy_(teacher_logits)
 
-    def forward(self, logits, *, labels=None, y_a=None, y_b=None, lam=None, teacher_logits=None):
+    def forward(self, logits, *, labels=None, y_a=None, y_b=None, lam=None, teacher_logits=None, valid=False):
         if self.graph_mode:
-            if self.criterion_type == 'CE':
+            if self.criterion_type == 'CE' or valid:
                 return self._ce(logits, labels=self.label_buf)
             elif self.criterion_type == 'Mixup_Cutmix':
                 return self._mc(logits, y_a=self.y_a_buf, y_b=self.y_b_buf, lam=self.lam_buf)
             elif self.criterion_type == 'KD':
                 return self._kd(logits, labels=self.label_buf, teacher_logits=self.teacher_logits_buf)
         else:
-            if self.criterion_type == 'CE':
+            if self.criterion_type == 'CE' or valid:
                 return self._ce(logits, labels=labels)
             elif self.criterion_type == 'Mixup_Cutmix':
                 return self._mc(logits, y_a=y_a, y_b=y_b, lam=lam)

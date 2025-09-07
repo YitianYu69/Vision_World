@@ -108,7 +108,7 @@ class Trainer():
             (self.graph_engine, self.static_x, self.static_y, self.static_logits, self.static_loss, self.compute_stream) = build_CUDA_Graph(self.engine, 
                                                                                                                                             self.cri, self.train_dataloader, 
                                                                                                                                             self.amp_enable, self.cast_dtype, 
-                                                                                                                                            self.device, self.scaler)
+                                                                                                                                            self.device, self.scaler, self.grad_acc_step)
             self.copy_stream = torch.cuda.Stream(device=device)
             self.copy_event = torch.cuda.Event()
         else:
@@ -162,18 +162,17 @@ class Trainer():
 
         return engine
 
-    def _training_step(self, data, target):
+    def _training_step(self, data, target, grad_step):
         if self.teacher_model is not None:
             with torch.inference_mode():
                 teacher_logits = self.teacher_model(data)
 
         if self._is_deepspeed():
             logits = self.engine(data)
-            loss = self.cri(logits, labels=target) if self.teacher_model is None else self.cri(logits, labels=target, teacher_logits=teacher_logits)
-            self.engine.backward(loss)
+            ori_loss = self.cri(logits, labels=target) if self.teacher_model is None else self.cri(logits, labels=target, teacher_logits=teacher_logits)
+            self.engine.backward(ori_loss)
             self.engine.step()
         else:
-            self.opt.zero_grad(set_to_none=True)
             # Branch using CUDA Graph or not
             if not self.CUDA_Graph:
                 device_type = "cuda" if str(self.device).startswith("cuda") else "cpu"
@@ -181,8 +180,11 @@ class Trainer():
                                     dtype=(self.cast_dtype if device_type in ['cuda', 'cpu'] else None),
                                     enabled=self.amp_enable and device_type in ['cuda', 'cpu']):
                     logits = self.engine(data)
-                    loss = self.cri(logits, labels=target) if self.teacher_model is None else self.cri(logits, labels=target, teacher_logits=teacher_logits)
+                    ori_loss = self.cri(logits, labels=target) if self.teacher_model is None else self.cri(logits, labels=target, teacher_logits=teacher_logits)
                     
+                    if isinstance(self.engine, nn.parallel.DistributedDataParallel) and self.grad_acc_step > 1:
+                        self.engine.require_backward_grad_sync = grad_step
+                    loss = ori_loss / self.grad_acc_step
                     if self.amp_enable and self.scaler is not None:
                         self.scaler.scale(loss).backward()
                     else:
@@ -197,7 +199,7 @@ class Trainer():
 
                 with torch.cuda.stream(self.copy_stream):
                     self.static_x.copy_(data, non_blocking=True)
-                    self.cri.set_batch_target(labels=labels) if self.teacher_model is None else self.cri.set_batch_target(labels, teacher_logits=teacher_logits)
+                    self.cri.set_batch_target(grad_acc_step=self.grad_acc_step, labels=target,) if self.teacher_model is None else self.cri.set_batch_target(grad_acc_step=self.grad_acc_step, labels=target, teacher_logits=teacher_logits)
                     self.copy_event.record(self.copy_stream)
 
                 with torch.cuda.stream(self.compute_stream):
@@ -205,22 +207,25 @@ class Trainer():
                     self.graph_engine.replay()
 
                 logits = self.static_logits
-                loss = self.static_loss
-                
-            if self.amp_enable and self.scaler is not None:
-                self.scaler.unscale_(self.opt)
-                torch.nn.utils.clip_grad_norm_(self.engine.parameters(), max_norm=1.0)
-                self.scaler.step(self.opt)
-                self.scaler.update()
-            else:
-                torch.nn.utils.clip_grad_norm_(self.engine.parameters(), max_norm=1.0)
-                self.opt.step()
+                ori_loss = self.static_loss
+            
+            if grad_step:
+                if self.amp_enable and self.scaler is not None:
+                    self.scaler.unscale_(self.opt)
+                    torch.nn.utils.clip_grad_norm_(self.engine.parameters(), max_norm=1.0)
+                    self.scaler.step(self.opt)
+                    self.scaler.update()
+                    self.opt.zero_grad(set_to_none=True)
+                else:
+                    torch.nn.utils.clip_grad_norm_(self.engine.parameters(), max_norm=1.0)
+                    self.opt.step()
+                    self.opt.zero_grad(set_to_none=True)
 
         if self.scheduler is not None:
             self.scheduler.step()
         if self.ema is not None:
             self.ema.update_parameters(self.engine)
-        return logits, loss
+        return logits, ori_loss
 
     @torch.no_grad()
     def _update_metrics(self, logits, target):
@@ -249,10 +254,11 @@ class Trainer():
             self.train_dataloader.sampler.set_epoch(epoch)
 
         start_time = time.time()
-        for data, target in self.train_dataloader:
+        for step, (data, target) in enumerate(self.train_dataloader):
             data, target = data.to(self.device, non_blocking=True), target.to(self.device, non_blocking=True)
+            grad_step = ((step + 1) % self.grad_acc_step == 0 or (step + 1) == len(self.train_dataloader))
 
-            logits, loss = self._training_step(data, target)
+            logits, loss = self._training_step(data, target, grad_step)
             self._update_metrics(logits, target)
         
             total_loss += loss.detach() * data.size(0)
@@ -285,7 +291,7 @@ class Trainer():
             data, target = data.to(self.device, non_blocking=True), target.to(self.device, non_blocking=True)
 
             logits = self.engine(data)
-            loss = self.cri(logits, target)
+            loss = self.cri(logits, labels=target, valid=True)
 
             self._update_metrics(logits, target)
             total_loss += loss.detach() * data.size(0)
