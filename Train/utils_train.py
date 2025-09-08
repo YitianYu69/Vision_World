@@ -88,7 +88,9 @@ def build_CUDA_Graph(model: nn.Module,
         raise ValueError(f"Unknown criterion type: {ctype}!")
     compute_stream = torch.cuda.Stream(device=device)
 
-    g = torch.cuda.CUDAGraph()
+    pool = torch.cuda.graph_pool_handle()
+    g_no_sync = torch.cuda.CUDAGraph()
+    g_sync = torch.cuda.CUDAGraph()
     if amp_enable and dtype == torch.float16:
         logger.info("Warning: with CUDA Graph and float16, please freeze the AMP!")
 
@@ -96,20 +98,31 @@ def build_CUDA_Graph(model: nn.Module,
     model.zero_grad(set_to_none=True)
     with torch.cuda.stream(compute_stream):
         if amp_enable:
-            with torch.cuda.graph(g):
+            model.require_backward_grad_sync = True
+            with torch.cuda.graph(g_sync, pool=pool):
                 with torch.amp.autocast(device_type='cuda', dtype=dtype):
                     logits = model(static_x)
                     ori_loss = criterion(logits)
                     loss = ori_loss / criterion.grad_acc_step_buf
                     scaler.scale(loss).backward() if scaler is not None else loss.backward()
+            model.require_backward_grad_sync = False
+            with torch.cuda.graph(g_no_sync, pool=pool):
+                with torch.amp.autocast(device_type='cuda', dtype=dtype):
+                    logits = model(static_x)
+                    ori_loss = criterion(logits)
         else:
-            with torch.cuda.graph(g):
+            model.require_backward_grad_sync = True
+            with torch.cuda.graph(g_sync, pool=pool):
                 logits = model(static_x)
                 ori_loss = criterion(logits)
                 loss = ori_loss / criterion.grad_acc_step_buf
                 loss.backward()
+            model.require_backward_grad_sync = False
+            with torch.cuda.graph(g_no_sync, pool=pool):
+                logits = model(static_x)
+                ori_loss = criterion(logits)
     
-    return g, static_x, cuda_y, logits, ori_loss, compute_stream
+    return g_sync, g_no_sync, static_x, cuda_y, logits, ori_loss, compute_stream
 
 
 

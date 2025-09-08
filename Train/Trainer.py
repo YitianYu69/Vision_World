@@ -12,6 +12,7 @@ import deepspeed
 
 import logging
 from utils_train import warmup, build_CUDA_Graph
+from utils_ddp import check_ddp
 
 import time
 from typing import Union, Callable, Dict, Optional
@@ -105,7 +106,7 @@ class Trainer():
                 self.engine = self._wrap_model_to_engine(model)
             logger.info("CUDA Graph Warmup!")
             warmup(self.engine, self.cri, self.train_dataloader.dataset, sub_data_portion, device)
-            (self.graph_engine, self.static_x, self.static_y, self.static_logits, self.static_loss, self.compute_stream) = build_CUDA_Graph(self.engine, 
+            (self.graph_sync, self.graph_no_sync, self.static_x, self.static_y, self.static_logits, self.static_loss, self.compute_stream) = build_CUDA_Graph(self.engine, 
                                                                                                                                             self.cri, self.train_dataloader, 
                                                                                                                                             self.amp_enable, self.cast_dtype, 
                                                                                                                                             self.device, self.scaler, self.grad_acc_step)
@@ -138,9 +139,9 @@ class Trainer():
             )
             logger.info("Model Wrap Type: DeepSpeed!")
         elif self.DDP_config is not None:
-            if dist.is_available() and dist.is_initialized() and self.rank0 and self.DDP_config.get('broadcast_buffers', True):
+            if check_ddp() and self.rank0 and self.DDP_config.get('broadcast_buffers', True):
                 logger.info('Please turn off the broadcast_buffers if you used the torch.nn.SyncBatchNorm.convert_sync_batchnorm().')
-            if dist.is_available() and dist.is_initialized() and self.rank0 and self.DDP_config.get('gradient_as_bucket_view', False):
+            if check_ddp() and self.rank0 and self.DDP_config.get('gradient_as_bucket_view', False):
                 logger.info('Please set set_to_none=True for optimizer.zero_grad(); otherwise DDP grad buckets may be zeroed out.')
 
             ddp_kwargs = dict(
@@ -204,7 +205,10 @@ class Trainer():
 
                 with torch.cuda.stream(self.compute_stream):
                     self.compute_stream.wait_event(self.copy_event)
-                    self.graph_engine.replay()
+                    if grad_step:
+                        self.graph_sync.replay()
+                    else:
+                        self.graph_no_sync.replay()
 
                 logits = self.static_logits
                 ori_loss = self.static_loss
