@@ -18,4 +18,7 @@ def setup_ddp():
     return local_rank, global_rank, world_size, device
 
 def clean():
-    dist.destory_process_group()
+    dist.destroy_process_group()
+
+def check_ddp():
+    return dist.is_available() and dist.is_initialized()
