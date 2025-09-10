@@ -5,8 +5,8 @@ import torch.nn.functional as F
 from torch.nn import CrossEntropyLoss, KLDivLoss
 
 from torch.ao.quantization import get_default_qat, qconfig
+from torch.ao.quantization.qconfig_mapping import QConfigMapping
 from torch.ao.quantization.quantize_fx import fuse_fx, prepare_qat_fx
-from torch.fx import symbolic_trace
 
 from torchmetrics import Metric, Accuracy, Recall, Precision, F1Score, AUROC
 
@@ -51,11 +51,13 @@ def prefetch(dataloader: DataLoader):
 def wrap_model_prepare_qat(model, *, image_size):
     sample_input = torch.rand((1, 3, image_size, image_size)).to('cuda')
 
+    torch.backends.quantized.engine('fbgemm')
+
     model.eval()
-    qconfig = get_default_qat_qconfig('x86')
-    model = symbolic_trace(model)
+    qconfig = get_default_qat_qconfig('fbgemm')
     model = fuse_fx(model)
-    model = prepare_qat_fx(model, {"", qconfig}, sample_input)
+    qconfig_mapping = QConfigMapping().set_global(qconfig)
+    model = prepare_qat_fx(model, qconfig_mapping, sample_input)
     return model
 
 
