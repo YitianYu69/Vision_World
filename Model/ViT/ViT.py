@@ -10,10 +10,10 @@ class PatchEmbed(nn.Module):
                  embed_dim: int = 768):
         super().__init__()
         self.num_patches = (image_size // patch_size) ** 2
-        self.conv = nn.Conv2d(in_channels, embed_dim, kernel_size=patch_size, stride=patch_size, bias=False)
+        self.proj = nn.Conv2d(in_channels, embed_dim, kernel_size=patch_size, stride=patch_size, bias=False)
 
     def forward(self, x):
-        x = self.conv(x) # batch_size, embed_dim, sqrt(num_patches), sqrt(num_patches)
+        x = self.proj(x) # batch_size, embed_dim, sqrt(num_patches), sqrt(num_patches)
         x = x.flatten(2) # batch_size, embed_dim, num_patches
         return x.transpose(1, 2).contiguous()
 
