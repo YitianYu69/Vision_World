@@ -4,6 +4,10 @@ from torch.utils.data import Dataset, DataLoader, Subset
 import torch.nn.functional as F
 from torch.nn import CrossEntropyLoss, KLDivLoss
 
+from torch.ao.quantization import get_default_qat, qconfig
+from torch.ao.quantization.quantize_fx import fuse_fx, prepare_qat_fx
+from torch.fx import symbolic_trace
+
 from torchmetrics import Metric, Accuracy, Recall, Precision, F1Score, AUROC
 
 import logging
@@ -43,6 +47,16 @@ def prefetch(dataloader: DataLoader):
         return next(it)
     except StopIteration:
         raise RuntimeError("Prefetch failed, dataloader is empty!")
+
+def wrap_model_prepare_qat(model, *, image_size):
+    sample_input = torch.rand((1, 3, image_size, image_size)).to('cuda')
+
+    model.eval()
+    qconfig = get_default_qat_qconfig('x86')
+    model = symbolic_trace(model)
+    model = fuse_fx(model)
+    model = prepare_qat_fx(model, {"", qconfig}, sample_input)
+    return model
 
 
 def build_CUDA_Graph(model: nn.Module,
@@ -88,6 +102,7 @@ def build_CUDA_Graph(model: nn.Module,
         raise ValueError(f"Unknown criterion type: {ctype}!")
     compute_stream = torch.cuda.Stream(device=device)
 
+    # Build CUDA Graph
     pool = torch.cuda.graph_pool_handle()
     g_no_sync = torch.cuda.CUDAGraph()
     g_sync = torch.cuda.CUDAGraph()
@@ -123,7 +138,6 @@ def build_CUDA_Graph(model: nn.Module,
                 ori_loss = criterion(logits)
     
     return g_sync, g_no_sync, static_x, cuda_y, logits, ori_loss, compute_stream
-
 
 
 class setup_criterion(nn.Module):
