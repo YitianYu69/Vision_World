@@ -13,6 +13,7 @@ from torchmetrics import Metric, Accuracy, Recall, Precision, F1Score, AUROC
 import logging
 
 import math
+from contextlib import contextmanager
 from typing import List, Union, Callable
 
 logger = logging.getLogger(__name__)
@@ -267,11 +268,12 @@ class EMA():
                  model,
                  decay = 0.999,
                  tau = 2000,
-                 device = 'cpu',
+                 device = None,
                  use_fp32_master = True,
                  include_buffers = True,
                  param_filters = None,
-                 update_every = 1):
+                 update_every = 1,
+                 kahan_compensation: bool = False):
 
         self.ema_model = self._unwrap_model(model)
         self.decay_base = float(decay)
@@ -279,11 +281,14 @@ class EMA():
         self.device = device
         self.use_fp32_master = use_fp32_master
         self.include_buffers = include_buffers
-        self.param_filters = param_filters or (lambda n, p: p.requires_grad and p.dtype.is_floating_point)
+        self.param_filters = param_filters or (lambda n, p: p.requires_grad and p.is_floating_point())
         self.update_every = update_every
         self.num_updates = 0
 
+        self._decay_prod = 1.0
+
         self.shadow_params = {}
+        self.kahan_comp = {} if kahan_compensation else None
         self.shadow_buffers = {}
 
         self._register(self.ema_model)
@@ -295,19 +300,25 @@ class EMA():
         self.shadow_params.clear()
         self.shadow_buffers.clear()
 
+        if self.kahan_comp is not None:
+            self.kahan_comp.clear()
+
         for n, p in self._named_fparameters(model):
             ema_p = p.detach().clone()
             if self.use_fp32_master:
                 ema_p = ema_p.to(torch.float32)
-            if self.device != 'cpu' and self.device is not None:
+            if self.device is not None:
                 ema_p = ema_p.to(self.device)
             ema_p.requires_grad_(False)
             self.shadow_params[n] = ema_p
+            # For Kahan
+            if self.kahan_comp is not None:
+                self.kahan_comp[n] = torch.zeros(ema_p.size(), dtype=ema_p.dtype, device=ema_p.device)
 
         if self.include_buffers:
             for n, b in model.named_buffers():
                 ema_b = b.detach().clone()
-                if self.device != 'cpu' and self.device is not None:
+                if self.device is not None:
                     ema_b = ema_b.to(self.device)
                 self.shadow_buffers[n] = ema_b
     
@@ -315,14 +326,21 @@ class EMA():
         self.device = device
         for n in self.shadow_params.keys():
             self.shadow_params[n] = self.shadow_params[n].to(self.device)
+            if self.kahan_comp is not None:
+                self.kahan_comp[n] = self.kahan_comp[n].to(self.device)
+
         if self.include_buffers:
             for n in self.shadow_buffers.keys():
                 self.shadow_buffers[n] = self.shadow_buffers[n].to(self.device)
+    
+    def _is_bn_stats(self, name):
+        return name.endswith('running_mean') or name.endswith('running_var')
 
+    @torch.no_grad()
     def update_parameters(self, model):
         if (self.num_updates + 1) % self.update_every != 0:
-            self.num_updates += 1
             return
+        
 
         model = self._unwrap_model(model)
         c_decay = self._current_decay()
@@ -330,25 +348,61 @@ class EMA():
         for n, p, ema_p in self._iter_named_fparameters_with_ema(model):
             if p is None or ema_p is None:
                 continue
+
+            # Ensure devices match; if user forced a different device via .to(),
+            # this will raise early instead of silently syncing each step.
+            if p.device != ema_p.device:
+                raise RuntimeError(
+                    f"EMA param {n} on {ema_p.device} but model param on {p.device}. "
+                    "Keep EMA on the same device for fast implicit promotion."
+                )
             
-            src = p.detach()
-            if self.use_fp32_master:
-                upd = src.float()
+            if self.kahan_comp is not None:
+                self.kahan_add_(ema_p, self.kahan_comp[n], p.detach(), c_decay)
             else:
-                upd = src.to(dtype=ema_p.dtype)
-            
-            ema_p.mul_(c_decay).add_(upd, alpha=1 - c_decay)
+                ema_p.mul_(c_decay).add_(p.detach(), alpha=1 - c_decay)
+
+        if self.include_buffers:
+            for n, b, ema_b in self._iter_named_buffers_with_ema(model):
+                if b is None or ema_b is None:
+                    continue
+                    
+                if b.device != ema_b.device:
+                    raise RuntimeError(
+                        f"EMA buffer {n} on {ema_b.device} but model buffer on {b.device}"
+                    )
+                
+                if self._is_bn_stats(n):
+                    ema_b.mul_(c_decay).add_(b.detach(), alpha=1 - c_decay)
+                else:
+                    ema_b.copy_(b.detach())
+
         
         self.num_updates += 1
+        self._decay_prod *= c_decay
+    
+    @torch.no_grad()
+    def kahan_add_(self, ema_p, kahan_comp, p, decay):
+        y = (1.0 - decay) * p - kahan_comp
+        t = ema_p.mul_(decay) + y
+        kahan_comp.copy_((t - ema_p) - y)
+        ema_p.copy_(t)
+
+    def _bias_correction(self):
+        # For the time-varying decay 
+        return 1.0 - (self._decay_prod) if self.num_updates > 0 else 1.0
 
     # Overwrite model's weights with ema_model's weights for evaluation
     @torch.no_grad()
-    def copy_to(self, model):
+    def copy_to(self, model, *, bias_correction=False):
         model = self._unwrap_model(model)
 
+        corr = 1.0
+        if bias_correction:
+            corr = 1.0 / max(self._bias_correction(), 1e-8)
         for n, p, ema_p in self._iter_named_fparameters_with_ema(model):
             if ema_p is not None:
-                p.copy_(ema_p.to(device=p.device, dtype=p.dtype))
+                p.copy_((ema_p * corr).to(device=p.device, dtype=p.dtype))
             
         if self.include_buffers:
             for n, b, ema_b in self._iter_named_buffers_with_ema(model):
@@ -400,3 +454,12 @@ class EMA():
         for n, b in model.named_buffers():
             ema_b = self.shadow_buffers.get(n, None)
             yield(n, b, ema_b)
+
+    @contextmanager
+    def average_parameters(self, model, *, bias_correction=False):
+        self.store(model)
+        try:
+            self.copy_to(model, bias_correction=bias_correction)
+            yield
+        finally:
+            self.restore(model)
