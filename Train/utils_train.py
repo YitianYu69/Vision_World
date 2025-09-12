@@ -4,7 +4,7 @@ from torch.utils.data import Dataset, DataLoader, Subset
 import torch.nn.functional as F
 from torch.nn import CrossEntropyLoss, KLDivLoss
 
-from torch.ao.quantization.qconfig import get_default_qat, qconfig
+from torch.ao.quantization.qconfig import get_default_qat_qconfig
 from torch.ao.quantization.qconfig_mapping import QConfigMapping
 from torch.ao.quantization.quantize_fx import fuse_fx, prepare_qat_fx
 
