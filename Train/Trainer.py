@@ -10,14 +10,14 @@ from torchmetrics import Metric
 
 import deepspeed
 
-import logging
+from log import get_logger
 from utils_train import warmup, build_CUDA_Graph, wrap_model_prepare_qat
 from utils_ddp import check_ddp
 
 import time
 from typing import Union, Callable, Dict, Optional
 
-logger = logging.getLogger(__name__)
+logger = get_logger()
 
 class Trainer():
     def __init__(self, 
