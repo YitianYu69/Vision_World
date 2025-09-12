@@ -11,7 +11,7 @@ from torchmetrics import Metric
 import deepspeed
 
 import logging
-from utils_train import warmup, build_CUDA_Graph
+from utils_train import warmup, build_CUDA_Graph, wrap_model_prepare_qat
 from utils_ddp import check_ddp
 
 import time
@@ -28,6 +28,8 @@ class Trainer():
                  DS_config: Dict = None,
                  DDP_config: Dict = None,
                  CUDA_Graph: bool = False,
+                 QAT: bool = False,
+                 amp_enable: bool = True,
                  dataloader: DataLoader = None,
                  sub_data_portion: float = 1.0,
                  criterion: Union[nn.Module, Callable] = None,
@@ -38,11 +40,13 @@ class Trainer():
                  ema: Callable = None,
                  num_epochs: int = 200,
                  grad_acc_step: int = 1,
-                 amp_enable: bool = True,
+                 image_size: int = 256,
                  device: Union[str, torch.device] = 'cpu'):
         self.DS_config = DS_config
         self.DDP_config = DDP_config
         self.CUDA_Graph = CUDA_Graph
+        self.amp_enable = amp_enable
+        self.QAT = QAT
         self.train_dataloader = dataloader
         self.cri = criterion
         self.opt = optimizer
@@ -52,12 +56,16 @@ class Trainer():
         self.ema = ema
         self.num_epochs = num_epochs
         self.grad_acc_step = grad_acc_step
-        self.amp_enable = amp_enable
         self.device = device.type if isinstance(device, torch.device) else device
         self.teacher_model = teacher_model
         
         # Avoid multiple dist function call
         self.rank0 = (dist.is_available() and dist.is_initialized() and dist.get_rank() == 0)
+
+        # Check the QAT and AMP mode confliction
+        assert self.QAT != self.aml_enable, "Please choose either QAT=True, or amp_enable=True!"
+        if self.QAT:
+            model = wrap_model_prepare_qat(model, image_size)
 
         # If using CUDA, move model to device first!
         if self.device != 'cpu':
