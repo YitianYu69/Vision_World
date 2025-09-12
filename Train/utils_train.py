@@ -50,6 +50,9 @@ def prefetch(dataloader: DataLoader):
         raise RuntimeError("Prefetch failed, dataloader is empty!")
 
 def wrap_model_prepare_qat(model, *, image_size):
+    if image_size is None:
+        raise ValueError('image_size cannot be None!')
+
     sample_input = torch.rand((1, 3, image_size, image_size)).to('cuda')
 
     torch.backends.quantized.engine('fbgemm')
@@ -291,6 +294,9 @@ class EMA():
         self.kahan_comp = {} if kahan_compensation else None
         self.shadow_buffers = {}
 
+        self.backed_params = {}
+        self.backed_buffers = {}
+
         self._register(self.ema_model)
 
     def _unwrap_model(self, model):
@@ -373,7 +379,7 @@ class EMA():
                     )
                 
                 if self._is_bn_stats(n):
-                    ema_b.mul_(c_decay).add_(b.detach(), alpha=1 - c_decay)
+                    ema_b.mul_(c_decay).add_(b.detach(), alpha=1.0 - c_decay)
                 else:
                     ema_b.copy_(b.detach())
 
@@ -463,3 +469,5 @@ class EMA():
             yield
         finally:
             self.restore(model)
+
+
