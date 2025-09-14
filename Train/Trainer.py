@@ -10,9 +10,9 @@ from torchmetrics import Metric
 
 import deepspeed
 
-from log import get_logger
-from utils_train import warmup, build_CUDA_Graph, wrap_model_prepare_qat
-from utils_ddp import check_ddp
+from Train.log import get_logger
+from Train.utils_train import warmup, build_CUDA_Graph, wrap_model_prepare_qat, build_cuda_graph_ddp
+from Train.utils_ddp import rank0
 
 import time
 from typing import Union, Callable, Dict, Optional
@@ -58,12 +58,9 @@ class Trainer():
         self.grad_acc_step = grad_acc_step
         self.device = device.type if isinstance(device, torch.device) else device
         self.teacher_model = teacher_model
-        
-        # Avoid multiple dist function call
-        self.rank0 = (dist.is_available() and dist.is_initialized() and dist.get_rank() == 0)
 
         # Check the QAT and AMP mode confliction
-        assert self.QAT != self.aml_enable, "Please choose either QAT=True, or amp_enable=True!"
+        assert (self.QAT != self.amp_enable) or (not self.QAT and not self.amp_enable), "Please choose either QAT=True, or amp_enable=True!"
         if self.QAT:
             model = wrap_model_prepare_qat(model, image_size)
 
@@ -80,7 +77,7 @@ class Trainer():
         if compile_type is not None:
             fullgraph = False if self.DS_config is not None else True
             model.compile(fullgraph=fullgraph, mode=compile_type)
-            if (self.DS_config is not None or self.DDP_config is not None) and compile_type != 'reduce-overhead' and self.rank0:
+            if (self.DS_config is not None or self.DDP_config is not None) and compile_type != 'reduce-overhead' and rank0():
                 logger.info("""For the max speed optimization, consider enabling reduce-overhead compile mode
                             to avoid rebuilding autograd graph!""")
             if teacher_model is not None:
@@ -107,15 +104,17 @@ class Trainer():
         # Wrap model to enable different optimization
         # ---------------------------------------------
         if self.CUDA_Graph and self.DS_config is None:
-            logger.info("CUDA Graph Enabled!")
+            if rank0():
+                logger.info("CUDA Graph Enabled!")
             side = torch.cuda.Stream(device=device)
+            warmup_stream = torch.cuda.Stream(device=device)
             side.wait_stream(torch.cuda.current_stream())
             with torch.cuda.Stream(side):
                 self.engine = self._wrap_model_to_engine(model)
-            logger.info("CUDA Graph Warmup!")
-            warmup(self.engine, self.cri, self.train_dataloader.dataset, sub_data_portion, device)
+            torch.cuda.current_stream(device).wait_stream(side)
+            torch.cuda.synchronize(device)
             (self.graph_sync, self.graph_no_sync, self.static_x, self.static_y, self.static_logits, self.static_loss, self.compute_stream) = build_CUDA_Graph(self.engine, 
-                                                                                                                                            self.cri, self.train_dataloader, 
+                                                                                                                                            self.cri, self.opt, self.train_dataloader, 
                                                                                                                                             self.amp_enable, self.cast_dtype, 
                                                                                                                                             self.device, self.scaler, self.grad_acc_step)
             self.copy_stream = torch.cuda.Stream(device=device)
@@ -138,23 +137,23 @@ class Trainer():
         return t
 
     def _wrap_model_to_engine(self, model, wrap_type='raw'):
-        model.to(self.device)
         if self.DS_config is not None:
             engine, _ = deepspeed.initialize(
                 model=model,
                 model_parameters=model.parameters(),
                 config=self.DS_config
             )
-            logger.info("Model Wrap Type: DeepSpeed!")
+            if rank0():
+                logger.info("Model Wrap Type: DeepSpeed!")
         elif self.DDP_config is not None:
-            if check_ddp() and self.rank0 and self.DDP_config.get('broadcast_buffers', True):
+            if rank0() and self.DDP_config.get('broadcast_buffers', True):
                 logger.info('Please turn off the broadcast_buffers if you used the torch.nn.SyncBatchNorm.convert_sync_batchnorm().')
-            if check_ddp() and self.rank0 and self.DDP_config.get('gradient_as_bucket_view', False):
+            if rank0() and self.DDP_config.get('gradient_as_bucket_view', False):
                 logger.info('Please set set_to_none=True for optimizer.zero_grad(); otherwise DDP grad buckets may be zeroed out.')
 
             ddp_kwargs = dict(
-                static_graph=self.DDP_config.get('static_graph', False),
-                broadcast_buffers=self.DDP_config.get('broadcast_buffers', True),
+                static_graph=self.DDP_config.get('static_graph', True),
+                broadcast_buffers=self.DDP_config.get('broadcast_buffers', False),
                 bucket_cap_mb=self.DDP_config.get('bucket_cap_mb', 25),
                 find_unused_parameters=self.DDP_config.get('find_unused_parameters', False),
                 gradient_as_bucket_view=self.DDP_config.get('gradient_as_bucket_view', False),
@@ -164,10 +163,18 @@ class Trainer():
                 model,
                 device_ids=self.DDP_config.get('device_ids'),
                 **ddp_kwargs)
-            logger.info("Model Wrap Type: DDP")
+            # (belt-and-suspenders) replace the logger with a no-op
+            class _NoopDDPLogger:
+                def set_runtime_stats_and_log(self, *a, **k): pass
+                def set_and_log_parameter(self, *a, **k): pass
+                def _log_stats(self, *a, **k): pass
+            engine.logger = _NoopDDPLogger()
+            if rank0():
+                logger.info("Model Wrap Type: DDP")
         else:
             engine = model
-            logger.info("Model Wrap Type: Raw")
+            if rank0():
+                logger.info("Model Wrap Type: Raw")
 
         return engine
 

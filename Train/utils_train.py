@@ -1,4 +1,5 @@
 import torch
+import torch._dynamo as dynamo
 from torch import nn
 from torch.utils.data import Dataset, DataLoader, Subset
 import torch.nn.functional as F
@@ -10,36 +11,55 @@ from torch.ao.quantization.quantize_fx import fuse_fx, prepare_qat_fx
 
 from torchmetrics import Metric, Accuracy, Recall, Precision, F1Score, AUROC
 
-import logging
+from Train.log import get_logger
+from Train.utils_ddp import rank0
+from timm.layers import BatchNormAct2d
 
 import math
 from contextlib import contextmanager
 from typing import List, Union, Callable
 
-logger = logging.getLogger(__name__)
+logger = get_logger()
 
 def warmup(model: nn.Module,
            criterion: nn.Module,
+           optimizer,
            dataset: Dataset, 
+           batch_size: int, 
            sub_data_portion: float,
            device: str):
-    model.train()
+    if rank0():
+        logger.info('Warmup Started!')
     n = range(int(len(dataset) * sub_data_portion))
     data = Subset(dataset, n)
-    dl = DataLoader(data, batch_size=32, shuffle=True, drop_last=True, num_workers=2, pin_memory=True, persistent_workers=True)
+    dl = DataLoader(data, batch_size=batch_size, shuffle=True, drop_last=True, num_workers=2, pin_memory=True, persistent_workers=True)
     model = model.to(device)
+
+    cpu_x, cpu_y = prefetch(dl)
+    cuda_y = cpu_y.to(device)
+    criterion.ensure_buffers_once(grad_acc_step=grad_acc_step, labels=cuda_y)
 
     for images, labels in dl:
         images, labels = images.to(device, non_blocking=True), labels.to(device, non_blocking=True)
 
-        model.zero_grad(set_to_none=True)
+        optimizer.zero_grad(set_to_none=True)
         logits = model(images)
-        loss = criterion(logits, labels=labels)
-        loss.backward()
 
-    if torch.cuda.is_available() and str(device).startswith('cuda'):
-        torch.cuda.synchronize()
-    model.zero_grad(set_to_none=True)
+        if criterion.graph_mode:
+            criterion.set_batch_target(grad_acc_step=1, labels=labels)
+            loss = criterion(logits)
+        else:
+            loss = criterion(logits, labels=labels)
+        loss = criterion(logits, labels)
+        loss.backward()
+        optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
+
+    optimizer.zero_grad(set_to_none=True)
+    torch.cuda.synchronize(device)
+    if rank0():
+        logger.info('Warmup Done!')
+
 
 def prefetch(dataloader: DataLoader):
     it = iter(dataloader)
@@ -50,106 +70,119 @@ def prefetch(dataloader: DataLoader):
         raise RuntimeError("Prefetch failed, dataloader is empty!")
 
 def wrap_model_prepare_qat(model, *, image_size):
+    if rank0():
+        logger.info('Prepare QAT!')
     if image_size is None:
         raise ValueError('image_size cannot be None!')
 
     sample_input = torch.rand((1, 3, image_size, image_size)).to('cuda')
 
-    torch.backends.quantized.engine('fbgemm')
+    torch.backends.quantized.engine = 'fbgemm'
 
     model.eval()
     qconfig = get_default_qat_qconfig('fbgemm')
     model = fuse_fx(model)
     qconfig_mapping = QConfigMapping().set_global(qconfig)
     model = prepare_qat_fx(model, qconfig_mapping, sample_input)
+    if rank0():
+        logger.info('Prepare QAT Done!')
     return model
 
 
 def build_CUDA_Graph(model: nn.Module,
                      criterion: nn.Module,
+                     opt,
                      dataloader: DataLoader,
                      amp_enable: bool = False,
                      dtype: torch.dtype = torch.float32,
                      device: str = 'cuda',
                      scaler: torch.amp.GradScaler = None,
-                     mode: str = 'default',
                      grad_acc_step: int = 1):
-
-    if hasattr(criterion, "graph_mode"):
-        criterion.graph_mode = True
-                
+    model.train()
     device = torch.device(device)
     cpu_x, cpu_y = prefetch(dataloader)
-    cuda_x, cuda_y = cpu_x.to(device, non_blocking=True), cpu_y.to(device, non_blocking=True)
+    cuda_x, cuda_y = cpu_x.to(device, non_blocking=True).contiguous(), cpu_y.to(device, non_blocking=True)
 
     static_x = torch.empty_like(cuda_x)
     static_x.copy_(cuda_x)
 
-    ctype = criterion.criterion_type
-    if ctype == 'CE':
-        criterion.ensure_buffers_once(grad_acc_step=grad_acc_step, labels=cuda_y)
-        criterion.set_batch_target(grad_acc_step=grad_acc_step, labels=cuda_y)
-    elif ctype == 'Mixup_Cutmix':
-        lam0 = torch.tensor(1.0, dtype=torch.float32, device=device)
-        criterion.ensure_buffers_once(grad_acc_step=grad_acc_step, labels=cuda_y, y_a=cuda_y, y_b=cuda_y, lam=lam0)
-        criterion.set_batch_target(grad_acc_step=grad_acc_step, labels=cuda_y, y_a=cuda_y, y_b=cuda_y, lam=lam0)
-    elif ctype == 'KD':
-        with torch.inference_mode():
-            out = model(static_x)
-        if not isinstance(out, tuple):
-            raise RuntimeError('Criterion expects the logits in tuple!')
-        _,  logits_kd = out
-        if logits_kd.ndim != 2:
-            raise RuntimeError(f'KD now only accepts head shape [B, C], got {logits_kd.size()} instead')
-        teacher_seed = torch.zeros_like(logits_kd, dtype=criterion.compute_dtype, device=device)
-        criterion.ensure_buffers_once(grad_acc_step=grad_acc_step, labels=cuda_y, teacher_logits=teacher_seed)
-        criterion.set_batch_target(grad_acc_step=grad_acc_step, labels=cuda_y, teacher_logits=teacher_seed)
-    else:
-        raise ValueError(f"Unknown criterion type: {ctype}!")
+    criterion.ensure_buffers_once(grad_acc_step=grad_acc_step, labels=cuda_y)
+    criterion.set_batch_target(grad_acc_step=grad_acc_step, labels=cuda_y)
+
     compute_stream = torch.cuda.Stream(device=device)
 
-    # Build CUDA Graph
-    pool = torch.cuda.graph_pool_handle()
-    g_no_sync = torch.cuda.CUDAGraph()
-    g_sync = torch.cuda.CUDAGraph()
-    if amp_enable and dtype == torch.float16:
-        logger.info("Warning: with CUDA Graph and float16, please freeze the AMP!")
+    n = range(int(len(dataloader.dataset) * 0.1))
+    data = Subset(dataloader.dataset, n)
+    dl = DataLoader(data, batch_size=16, shuffle=True, drop_last=True, num_workers=2, pin_memory=True, persistent_workers=True)
+    if rank0():
+        logger.info('CUDA Graph Warmup!')
+    with torch.cuda.stream(compute_stream), torch.enable_grad():
+        out  = model(static_x)
+        loss = criterion(out)
+        loss.backward()
+        opt.step()
+        opt.zero_grad(set_to_none=True)
+    torch.cuda.current_stream(device).wait_stream(compute_stream)
+    torch.cuda.synchronize(device)
+    if rank0():
+        logger.info('CUDA Graph Warmup Done!')
 
-    model.train()
-    model.zero_grad(set_to_none=True)
-    with torch.cuda.stream(compute_stream):
+                
+    # Build CUDA Graph
+    if rank0():
+        logger.info('Strat Building CUDA Graph!')
+    def _capture_sync():
         if amp_enable:
-            model.require_backward_grad_sync = True
-            with torch.cuda.graph(g_sync, pool=pool):
-                with torch.amp.autocast(device_type='cuda', dtype=dtype):
-                    logits = model(static_x)
-                    ori_loss = criterion(logits)
-                    loss = ori_loss / criterion.grad_acc_step_buf
-                    scaler.scale(loss).backward() if scaler is not None else loss.backward()
-            model.require_backward_grad_sync = False
-            with torch.cuda.graph(g_no_sync, pool=pool):
-                with torch.amp.autocast(device_type='cuda', dtype=dtype):
-                    logits = model(static_x)
-                    ori_loss = criterion(logits)
-        else:
-            model.require_backward_grad_sync = True
-            with torch.cuda.graph(g_sync, pool=pool):
+            with torch.amp.autocast(device_type='cuda', dtype=dtype):
                 logits = model(static_x)
                 ori_loss = criterion(logits)
                 loss = ori_loss / criterion.grad_acc_step_buf
-                loss.backward()
-            model.require_backward_grad_sync = False
-            with torch.cuda.graph(g_no_sync, pool=pool):
+                scaler.scale(loss).backward() if scaler is not None else loss.backward()
+        else:
+            logits = model(static_x)
+            ori_loss = criterion(logits)
+            loss = ori_loss / criterion.grad_acc_step_buf
+            loss.backward()
+        return logits, ori_loss
+
+    def _capture_no_sync():
+        if amp_enable:
+            with torch.amp.autocast(device_type='cuda', dtype=dtype):
                 logits = model(static_x)
                 ori_loss = criterion(logits)
-    
+        else:
+            logits = model(static_x)
+            ori_loss = criterion(logits)
+        return logits, ori_loss
+
+    pool = torch.cuda.graph_pool_handle()
+    g_no_sync = torch.cuda.CUDAGraph()
+    g_sync = torch.cuda.CUDAGraph()
+    if rank0() and amp_enable and dtype == torch.float16:
+        logger.info("Warning: with CUDA Graph and float16, please freeze the AMP!")
+
+    model.zero_grad(set_to_none=True)
+    compute_stream.wait_stream(torch.cuda.current_stream())
+
+    with torch.cuda.stream(compute_stream):
+        with model.no_sync():
+            with torch.cuda.graph(g_no_sync, pool=pool):
+                logits, ori_loss = _capture_no_sync()
+            torch.cuda.synchronize()
+
+        with torch.cuda.graph(g_sync, pool=pool):
+                logits, ori_loss = _capture_sync()
+
+    torch.cuda.current_stream(device).wait_stream(compute_stream)
+    torch.cuda.synchronize(device)
+    if rank0():
+        logger.info('Building CUDA Graph Done!')
     return g_sync, g_no_sync, static_x, cuda_y, logits, ori_loss, compute_stream
 
 
 class setup_criterion(nn.Module):
-    def __init__(self, *, labels=None, label_smoothing=None, criterion_type='default', graph_mode=False,
-                 y_a=None, y_b=None, lam=None,
-                 temperature=None, alpha_kd=0.5, teacher_logits=None, amp=None):
+    def __init__(self, *, label_smoothing=None, criterion_type='default', graph_mode=False,
+                 temperature=None, alpha_kd=0.5, amp=None):
         super().__init__()
 
         if criterion_type == 'KD':
@@ -179,7 +212,7 @@ class setup_criterion(nn.Module):
             self.register_buffer('lam_buf', None, persistent=False)
             self.register_buffer('teacher_logits_buf', None, persistent=False)
             self.register_buffer('grad_acc_step_buf', None, persistent=False)
-            logger.info('Graph Mode turned on!')
+            logger.info('Criterion Graph Mode turned on!')
             
     def _ce(self, logits, *, labels):
         return self.ce(logits, labels)
@@ -239,15 +272,15 @@ class setup_criterion(nn.Module):
                 return self._kd(logits, labels=labels, teacher_logits=teacher_logits)
             
 
-    
 
 def build_metrics(*, metric_lists: List[str],
                   task:str,
                   num_classes: int,
                   average_type: str,
                   sync: bool,
-                  device: Union[str, torch.device] = "cpu"):
-    kwargs = dict(task=task, num_classes=num_classes, average=average_type, sync_on_compute=sync)
+                  device: Union[str, torch.device] = "cpu",
+                  top_k: int = 1):
+    kwargs = dict(task=task, num_classes=num_classes, average=average_type, sync_on_compute=sync, top_k=top_k)
 
     metrics = {
         'Accuracy' : Accuracy(**kwargs).to(device),
