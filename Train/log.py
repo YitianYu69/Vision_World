@@ -3,9 +3,12 @@ import sys
 import os
 from datetime import datetime
 
-def get_logger():
+def get_logger(log_dir="logs"):
+    os.makedir(log_dir, exist_ok=True)
+
+
     file_name = os.path.splitext(os.path.basename(sys.argv[0]))[0]
-    log_file = f"{file_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+    log_file = os.path.join(log_dir, f"{file_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
 
     logger = logging.getLogger()
     logger.setLevel(logging.INFO)
