@@ -17,8 +17,11 @@ def setup_ddp():
     torch.cuda.set_device(device)
     return local_rank, global_rank, world_size, device
 
+def rank0():
+    return (dist.is_available() and dist.is_initialized() and dist.get_rank() == 0)
+
 def clean():
     dist.destroy_process_group()
 
-def check_ddp():
-    return dist.is_available() and dist.is_initialized()
+
+
